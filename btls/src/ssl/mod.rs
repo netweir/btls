@@ -2109,6 +2109,15 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_record_size_limit(self.as_ptr(), limit as _) }
     }
 
+    /// Sets whether the ClientHelloInner is written as NSS writes it: the
+    /// encrypted_client_hello marker first, and the ClientHelloOuter's
+    /// cipher suites.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_CTX_set_ech_inner_like_nss)]
+    pub fn set_ech_inner_like_nss(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_ech_inner_like_nss(self.as_ptr(), enabled as _) }
+    }
+
     /// Sets whether the context should enable delegated credentials.
     #[cfg(not(feature = "fips"))]
     #[corresponds(SSL_CTX_set_delegated_credentials)]

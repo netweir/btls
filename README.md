@@ -6,6 +6,22 @@
 
 BoringSSL bindings for the Rust programming language and TLS adapters for [tokio](https://github.com/tokio-rs/tokio).
 
+## This fork
+
+This is [Netweir](https://github.com/netweir/netweir)'s fork of btls, on
+the `netweir` branch, at upstream's `12988758`, the revision wreq pins.
+Netweir uses it to send Firefox's Encrypted Client Hello over TCP. It
+changes nothing a connection sends unless it's asked for, except where
+noted:
+
+- `SslContextBuilder::set_ech_inner_like_nss(enabled)`
+  (`SSL_CTX_set_ech_inner_like_nss`, patch 0011): write the
+  ClientHelloInner as NSS writes it, with the encrypted_client_hello
+  marker first and the ClientHelloOuter's cipher suites.
+- delegated_credentials and record_size_limit, which only the patches
+  here send, are compressed into ech_outer_extensions like BoringSSL's
+  own extensions, since they're the same in both ClientHellos.
+
 ## Documentation
  - BoringSSL API: <https://docs.rs/btls>
  - BoringSSL FFI bindings: <https://docs.rs/btls-sys>
