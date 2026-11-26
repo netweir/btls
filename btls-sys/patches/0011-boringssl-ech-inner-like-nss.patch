@@ -13,15 +13,21 @@ NSS (Firefox) and BoringSSL build ClientHelloInner differently:
   record-size-limit and delegated-credentials patches wrote them
   uncompressed.
 
-SSL_CTX_set_ech_inner_like_nss turns on the first two, and both
-extensions are now compressible, as BoringSSL's own extensions are
-when they match. Recorded against Firefox 160.0.1 in
+- NSS's GREASE ECH draws AES-128-GCM or ChaCha20-Poly1305 at random,
+  and its payload is as long as the EncodedClientHelloInner would be,
+  padded for a maximum_name_length of 100 (tls13_MaybeGreaseEch).
+  BoringSSL's takes AES-128-GCM wherever it has AES hardware, and a
+  random length.
+
+SSL_CTX_set_ech_inner_like_nss turns on the first two and the last,
+and both extensions are now compressible, as BoringSSL's own extensions
+are when they match. Recorded against Firefox 160.0.1 in
 netweir/netweir's profiles/firefox-160-macos.ech.capture.json.
 ---
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5610,6 +5610,13 @@
+@@ -5610,6 +5610,16 @@
  // send record size limit extension.
  OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
  
@@ -29,12 +35,89 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 +// write their ClientHelloInner as NSS does: the encrypted_client_hello
 +// marker first, and the same cipher suites as the ClientHelloOuter, TLS 1.2
 +// ones included. By default the marker goes where the extension order puts
-+// it and the ClientHelloInner offers only TLS 1.3 cipher suites.
++// it and the ClientHelloInner offers only TLS 1.3 cipher suites. It also
++// makes GREASE ECH NSS's: AES-128-GCM or ChaCha20-Poly1305 drawn at random,
++// and a payload as long as the EncodedClientHelloInner would be, padded for
++// a maximum_name_length of 100.
 +OPENSSL_EXPORT void SSL_CTX_set_ech_inner_like_nss(SSL_CTX *ctx, int enabled);
 +
  // SSL_CTX_set_record_size_limit configures whether sockets on |ctx| should
  // send record size limit extension.
  OPENSSL_EXPORT void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit);
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -729,6 +729,40 @@
+   return value % (max - min + 1) + min;
+ }
+ 
++// The length NSS gives a GREASE ECH payload's plaintext (tls13_MaybeGreaseEch
++// in lib/ssl/tls13ech.c): the EncodedClientHelloInner this ClientHello would
++// have, padded by tls13_PadChInner as for a configuration whose
++// maximum_name_length is 100, NSS's default greaseEchSize, which Firefox
++// keeps (security.tls.ech.grease_size).
++static bool grease_ech_plaintext_len_like_nss(SSL_HANDSHAKE *hs,
++                                              size_t *out_len) {
++  SSLImpl *const ssl = hs->ssl;
++  ScopedCBB body, encoded;
++  if (!CBB_init(body.get(), 512) || !CBB_init(encoded.get(), 256) ||
++      !ssl_write_client_hello_without_extensions(hs, body.get(),
++                                                 ssl_client_hello_inner,
++                                                 /*empty_session_id=*/false) ||
++      !ssl_write_client_hello_without_extensions(hs, encoded.get(),
++                                                 ssl_client_hello_inner,
++                                                 /*empty_session_id=*/true) ||
++      !ssl_add_clienthello_tlsext(hs, body.get(), encoded.get(),
++                                  ssl_client_hello_inner)) {
++    return false;
++  }
++  const size_t kGreaseMaxNameLen = 100;
++  size_t padding_len = 0;
++  if (ssl->hostname) {
++    size_t hostname_len = strlen(ssl->hostname.get());
++    if (hostname_len <= kGreaseMaxNameLen) {
++      padding_len = kGreaseMaxNameLen - hostname_len;
++    }
++  }
++  size_t len = CBB_len(encoded.get());
++  padding_len += 31 - ((len + padding_len - 1) % 32);
++  *out_len = len + padding_len;
++  return true;
++}
++
+ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   assert(!hs->selected_ech_config);
+   if (hs->max_version < TLS1_3_VERSION || !hs->config->ech_grease_enabled) {
+@@ -741,6 +775,17 @@
+                               : EVP_has_aes_hardware();
+   const EVP_HPKE_AEAD *aead =
+       has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
++  size_t nss_plaintext_len = 0;
++  if (hs->config->ech_inner_like_nss) {
++    // NSS draws AES-128-GCM or ChaCha20-Poly1305 at random for each GREASE
++    // ECH extension, whatever the hardware (tls13_MaybeGreaseEch).
++    uint8_t coin;
++    if (!RAND_bytes(&coin, 1) ||
++        !grease_ech_plaintext_len_like_nss(hs, &nss_plaintext_len)) {
++      return false;
++    }
++    aead = (coin & 1) ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
++  }
+   static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+                 "hs->grease_seed is too small");
+   uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
+@@ -765,7 +810,10 @@
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+   const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++      (hs->config->ech_inner_like_nss
++           ? nss_plaintext_len
++           : 32 * random_size(128 / 32, 224 / 32)) +
++      aead_overhead(aead);
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
