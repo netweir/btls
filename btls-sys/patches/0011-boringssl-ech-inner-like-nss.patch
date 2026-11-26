@@ -47,7 +47,7 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
 --- a/ssl/encrypted_client_hello.cc
 +++ b/ssl/encrypted_client_hello.cc
-@@ -729,6 +729,40 @@
+@@ -729,6 +729,50 @@
    return value % (max - min + 1) + min;
  }
  
@@ -59,16 +59,26 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
 +static bool grease_ech_plaintext_len_like_nss(SSL_HANDSHAKE *hs,
 +                                              size_t *out_len) {
 +  SSLImpl *const ssl = hs->ssl;
++  // A real ClientHelloInner's pre_shared_key has binders over a transcript
++  // GREASE has none of, so it's left out here. NSS copies the
++  // ClientHelloOuter's pre_shared_key into the one it measures instead, so
++  // that one's length is added back.
++  const size_t psk_len =
++      ssl_clienthello_psk_len(hs, ssl_client_hello_unencrypted);
++  Vector<SSLPreSharedKey> psks;
++  std::swap(psks, hs->pre_shared_keys);
 +  ScopedCBB body, encoded;
-+  if (!CBB_init(body.get(), 512) || !CBB_init(encoded.get(), 256) ||
-+      !ssl_write_client_hello_without_extensions(hs, body.get(),
-+                                                 ssl_client_hello_inner,
-+                                                 /*empty_session_id=*/false) ||
-+      !ssl_write_client_hello_without_extensions(hs, encoded.get(),
-+                                                 ssl_client_hello_inner,
-+                                                 /*empty_session_id=*/true) ||
-+      !ssl_add_clienthello_tlsext(hs, body.get(), encoded.get(),
-+                                  ssl_client_hello_inner)) {
++  bool ok = CBB_init(body.get(), 512) && CBB_init(encoded.get(), 256) &&
++            ssl_write_client_hello_without_extensions(
++                hs, body.get(), ssl_client_hello_inner,
++                /*empty_session_id=*/false) &&
++            ssl_write_client_hello_without_extensions(
++                hs, encoded.get(), ssl_client_hello_inner,
++                /*empty_session_id=*/true) &&
++            ssl_add_clienthello_tlsext(hs, body.get(), encoded.get(),
++                                       ssl_client_hello_inner);
++  std::swap(psks, hs->pre_shared_keys);
++  if (!ok) {
 +    return false;
 +  }
 +  const size_t kGreaseMaxNameLen = 100;
@@ -79,7 +89,7 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
 +      padding_len = kGreaseMaxNameLen - hostname_len;
 +    }
 +  }
-+  size_t len = CBB_len(encoded.get());
++  size_t len = CBB_len(encoded.get()) + psk_len;
 +  padding_len += 31 - ((len + padding_len - 1) % 32);
 +  *out_len = len + padding_len;
 +  return true;
@@ -88,7 +98,7 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
  static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
    assert(!hs->selected_ech_config);
    if (hs->max_version < TLS1_3_VERSION || !hs->config->ech_grease_enabled) {
-@@ -741,6 +775,17 @@
+@@ -741,6 +785,17 @@
                                : EVP_has_aes_hardware();
    const EVP_HPKE_AEAD *aead =
        has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
@@ -106,7 +116,7 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
    static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
                  "hs->grease_seed is too small");
    uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
-@@ -765,7 +810,10 @@
+@@ -765,7 +820,10 @@
    // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
    // to a multiple of 32, to match RFC 9849, section 6.1.3.
    const size_t payload_len =
@@ -132,7 +142,19 @@ diff --git a/ssl/extensions.cc b/ssl/extensions.cc
      if (!CBB_add_u16(out, TLSEXT_TYPE_encrypted_client_hello) ||
          !CBB_add_u16(out, /* length */ 1) ||
          !CBB_add_u8(out, ECH_CLIENT_INNER)) {
-@@ -3328,8 +3332,9 @@
+@@ -2009,6 +2013,11 @@
+   return ret;
+ }
+ 
++size_t ssl_clienthello_psk_len(const SSL_HANDSHAKE *hs,
++                               ssl_client_hello_type_t type) {
++  return ext_pre_shared_key_clienthello_length(hs, type);
++}
++
+ // ext_pre_shared_key_add_clienthello writes a pre_shared_key extension to
+ // `out_extensions` and flushes `out_client_hello`, invalidating
+ // `out_extensions`. `out_extensions` must be a child of `out_client_hello`.
+@@ -3328,8 +3337,9 @@
    const Array<uint16_t> &signature_hash_algorithms =
        hs->config->delegated_credentials;
  
@@ -144,7 +166,7 @@ diff --git a/ssl/extensions.cc b/ssl/extensions.cc
        !CBB_add_u16_length_prefixed(&contents, &data)) {
      return false;
    }
-@@ -3340,7 +3345,7 @@
+@@ -3340,7 +3350,7 @@
      }
    }
  
@@ -153,7 +175,7 @@ diff --git a/ssl/extensions.cc b/ssl/extensions.cc
      return false;
    }
  
-@@ -3906,9 +3911,10 @@
+@@ -3906,9 +3916,10 @@
    if (hs->config->record_size_limit != 0) {
      CBB data;
      const uint16_t data_ = hs->config->record_size_limit;
@@ -167,7 +189,7 @@ diff --git a/ssl/extensions.cc b/ssl/extensions.cc
        return false;
      }
    }
-@@ -4588,6 +4594,21 @@
+@@ -4588,6 +4599,21 @@
    }
  
    hs->inner_extensions_sent = 0;
@@ -218,7 +240,19 @@ diff --git a/ssl/internal.h b/ssl/internal.h
    // delegated_credentials, if not empty, is the set of signature algorithms
    // supported by the client.
    Array<uint16_t> delegated_credentials;
-@@ -4268,6 +4272,10 @@
+@@ -3850,6 +3854,11 @@
+ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+                                 ssl_client_hello_type_t type);
+ 
++// ssl_clienthello_psk_len returns the length of the pre_shared_key extension
++// a ClientHello of `type` carries, or zero if it carries none.
++size_t ssl_clienthello_psk_len(const SSL_HANDSHAKE *hs,
++                               ssl_client_hello_type_t type);
++
+ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out);
+ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
+                                   const SSL_CLIENT_HELLO *client_hello);
+@@ -4268,6 +4277,10 @@
  
    // record_size_limit is whether to send record size limit extension.
    uint16_t record_size_limit = 0;
