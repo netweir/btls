@@ -27,7 +27,7 @@ netweir/netweir's profiles/firefox-160-macos.ech.capture.json.
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5610,6 +5610,16 @@
+@@ -5610,6 +5610,22 @@
  // send record size limit extension.
  OPENSSL_EXPORT void SSL_set_record_size_limit(SSL *ssl, uint16_t limit);
  
@@ -41,13 +41,19 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 +// a maximum_name_length of 100.
 +OPENSSL_EXPORT void SSL_CTX_set_ech_inner_like_nss(SSL_CTX *ctx, int enabled);
 +
++// SSL_set_ech_padding_name_len sets the length of the name |ssl| connects
++// to, for when it sends no server_name, as for an IP address. With
++// |SSL_CTX_set_ech_inner_like_nss|, GREASE ECH pads for that name as NSS
++// pads for the URL's host (tls13_PadChInner). Zero, the default, is no name.
++OPENSSL_EXPORT void SSL_set_ech_padding_name_len(SSL *ssl, size_t len);
++
  // SSL_CTX_set_record_size_limit configures whether sockets on |ctx| should
  // send record size limit extension.
  OPENSSL_EXPORT void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit);
 diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
 --- a/ssl/encrypted_client_hello.cc
 +++ b/ssl/encrypted_client_hello.cc
-@@ -729,6 +729,50 @@
+@@ -729,6 +729,51 @@
    return value % (max - min + 1) + min;
  }
  
@@ -81,13 +87,14 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
 +  if (!ok) {
 +    return false;
 +  }
++  // NSS pads for the URL's host, which it has whether or not it sends
++  // server_name for it (none goes to an IP address).
 +  const size_t kGreaseMaxNameLen = 100;
++  const size_t name_len = ssl->hostname ? strlen(ssl->hostname.get())
++                                        : hs->config->ech_padding_name_len;
 +  size_t padding_len = 0;
-+  if (ssl->hostname) {
-+    size_t hostname_len = strlen(ssl->hostname.get());
-+    if (hostname_len <= kGreaseMaxNameLen) {
-+      padding_len = kGreaseMaxNameLen - hostname_len;
-+    }
++  if (name_len <= kGreaseMaxNameLen) {
++    padding_len = kGreaseMaxNameLen - name_len;
 +  }
 +  size_t len = CBB_len(encoded.get()) + psk_len;
 +  padding_len += 31 - ((len + padding_len - 1) % 32);
@@ -98,7 +105,7 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
  static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
    assert(!hs->selected_ech_config);
    if (hs->max_version < TLS1_3_VERSION || !hs->config->ech_grease_enabled) {
-@@ -741,6 +785,17 @@
+@@ -741,6 +786,17 @@
                                : EVP_has_aes_hardware();
    const EVP_HPKE_AEAD *aead =
        has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
@@ -116,7 +123,7 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
    static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
                  "hs->grease_seed is too small");
    uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
-@@ -765,7 +820,10 @@
+@@ -765,7 +821,10 @@
    // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
    // to a multiple of 32, to match RFC 9849, section 6.1.3.
    const size_t payload_len =
@@ -229,7 +236,7 @@ diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
 diff --git a/ssl/internal.h b/ssl/internal.h
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -3585,6 +3585,10 @@
+@@ -3585,6 +3585,14 @@
    // record_size_limit is whether to send record size limit extension.
    uint16_t record_size_limit = 0;
  
@@ -237,10 +244,14 @@ diff --git a/ssl/internal.h b/ssl/internal.h
 +  // writes it. See |SSL_CTX_set_ech_inner_like_nss|.
 +  bool ech_inner_like_nss = false;
 +
++  // ech_padding_name_len is the length of the name connected to when no
++  // server_name is sent. See |SSL_set_ech_padding_name_len|.
++  size_t ech_padding_name_len = 0;
++
    // delegated_credentials, if not empty, is the set of signature algorithms
    // supported by the client.
    Array<uint16_t> delegated_credentials;
-@@ -3850,6 +3854,11 @@
+@@ -3850,6 +3858,11 @@
  bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
                                  ssl_client_hello_type_t type);
  
@@ -252,7 +263,7 @@ diff --git a/ssl/internal.h b/ssl/internal.h
  bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out);
  bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
                                    const SSL_CLIENT_HELLO *client_hello);
-@@ -4268,6 +4277,10 @@
+@@ -4268,6 +4281,10 @@
  
    // record_size_limit is whether to send record size limit extension.
    uint16_t record_size_limit = 0;
@@ -274,7 +285,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
    ssl->config->preserve_tls13_cipher_list =
        ctx_impl->preserve_tls13_cipher_list;
  
-@@ -2361,6 +2362,10 @@
+@@ -2361,6 +2362,18 @@
  
  void SSL_CTX_set_record_size_limit(SSL_CTX *ctx, uint16_t limit) {
    FromOpaque(ctx)->record_size_limit = limit;
@@ -282,6 +293,14 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 +
 +void SSL_CTX_set_ech_inner_like_nss(SSL_CTX *ctx, int enabled) {
 +  FromOpaque(ctx)->ech_inner_like_nss = !!enabled;
++}
++
++void SSL_set_ech_padding_name_len(SSL *ssl, size_t len) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return;
++  }
++  ssl_impl->config->ech_padding_name_len = len;
  }
  
  void SSL_CTX_set_preserve_tls13_cipher_list(SSL_CTX *ctx,

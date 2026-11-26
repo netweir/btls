@@ -214,6 +214,10 @@ impl ConnectConfiguration {
         if self.sni && domain.parse::<IpAddr>().is_err() {
             self.ssl.set_hostname(domain)?;
         }
+        // For GREASE ECH padded as NSS pads it, which counts the name
+        // even when no server_name carries it.
+        #[cfg(not(feature = "fips"))]
+        self.ssl.set_ech_padding_name_len(domain.len());
 
         if self.verify_hostname {
             setup_verify_hostname(&mut self.ssl, domain)?;

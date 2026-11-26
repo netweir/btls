@@ -89,7 +89,6 @@ use crate::pkey::{HasPrivate, PKeyRef, Params, Private};
 use crate::srtp::{SrtpProtectionProfile, SrtpProtectionProfileRef};
 use crate::ssl::bio::BioMethod;
 use crate::ssl::callbacks::*;
-
 use crate::ssl::error::InnerError;
 use crate::stack::{Stack, StackRef, Stackable};
 use crate::symm::CipherCtxRef;
@@ -4114,6 +4113,15 @@ impl SslRef {
                 Some(slice::from_raw_parts(data.cast::<u8>(), len))
             }
         }
+    }
+
+    /// Sets the length of the name this connection is for when it sends no
+    /// server_name, as for an IP address, which GREASE ECH pads for with
+    /// `set_ech_inner_like_nss`.
+    #[cfg(not(feature = "fips"))]
+    #[corresponds(SSL_set_ech_padding_name_len)]
+    pub fn set_ech_padding_name_len(&mut self, len: usize) {
+        unsafe { ffi::SSL_set_ech_padding_name_len(self.as_ptr(), len) }
     }
 
     // Whether or not `SSL` negotiated ECH.
